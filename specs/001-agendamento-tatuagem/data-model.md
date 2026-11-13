@@ -200,6 +200,10 @@ Aceitar ou recusar exige `status = invited` **e** `now < expires_at`; senão
 
 ## Agenda
 
+As faixas de atendimento (FR-007, formerly "horários disponíveis") vêm de três fontes; todas
+têm capacidade `1 ≤ capacity ≤ seats` e só sessões **confirmadas** as ocupam. No código e na
+API, faixa de atendimento = **`window`** (ex.: `windows`, `window_start`, `requested_window`).
+
 ### weekly_rule (Padrão Semanal)
 | Campo | Tipo | Regras |
 |---|---|---|
@@ -209,9 +213,8 @@ Aceitar ou recusar exige `status = invited` **e** `now < expires_at`; senão
 | start_time / end_time | time | hora local do estúdio; `start_time < end_time` |
 | capacity | smallint | 1 ≤ capacity ≤ `seats` (FR-007, FR-007c) |
 
-Regras do mesmo estúdio no mesmo dia da semana não podem se sobrepor entre si. Horários de
-origens diferentes (padrão, exceção, avulso) **podem** se sobrepor; o limite físico é
-garantido por `seats`.
+Regras do mesmo estúdio no mesmo dia da semana não podem se sobrepor entre si. Faixas de
+origens diferentes (padrão, exceção, avulsa) **podem** se sobrepor; o limite físico é `seats`.
 
 ### date_override (exceção por data)
 | Campo | Tipo | Regras |
@@ -219,10 +222,10 @@ garantido por `seats`.
 | id | uuid | PK |
 | studio_id | uuid | FK |
 | date | date | data local do estúdio; único por `(studio_id, date)` |
-| blocked | boolean | `true` = nenhum horário novo na data |
+| blocked | boolean | `true` = nenhuma faixa na data |
 | windows | jsonb? | quando não bloqueada: `[{start_time, end_time, capacity}]` que substitui as regras semanais da data; sem sobreposição entre si; `capacity ≤ seats` |
 
-### one_off_slot (horário avulso)
+### one_off_slot (faixa avulsa)
 | Campo | Tipo | Regras |
 |---|---|---|
 | id | uuid | PK |
@@ -230,27 +233,28 @@ garantido por `seats`.
 | starts_at / ends_at | timestamptz | `starts_at < ends_at`, no futuro |
 | capacity | smallint | 1 ≤ capacity ≤ `seats` |
 
-### Ocorrência (Horário Disponível): calculada, não persistida
-`{studio_id, starts_at, ends_at, capacity, booked, free}`
+### Faixa de atendimento da data: calculada, não persistida
+`Window {studio_id, date, start, end, capacity}`
 
-Cálculo para um intervalo pedido, recortado pela janela do estúdio
-`[now + min_notice_hours, now + max_advance_days]` (FR-007e):
-1. Para cada data, se houver `date_override`: bloqueada → nenhuma ocorrência; senão usa
-   `windows`. Sem override → aplica as `weekly_rule` do dia da semana.
-2. Acrescenta `one_off_slot` do intervalo.
-3. Quando a consulta é para um tatuador: descarta ocorrências cujo dia da semana local não
-   está em `affiliation.weekdays` (FR-007d) e as que se sobrepõem a agendamentos ativos dele
-   em qualquer estúdio (FR-010).
-4. `booked` = agendamentos ativos do estúdio com o mesmo `starts_at`/`ends_at`.
-5. `peak` = maior número de agendamentos ativos do estúdio simultâneos em algum instante do
-   intervalo da ocorrência (qualquer origem).
-6. `free = min(capacity − booked, seats − peak)`, mínimo 0 (FR-007c); `free = 0` não aparece.
+1. Para a data: se houver `date_override`, bloqueada → nenhuma faixa; senão usa `windows`.
+   Sem override → as `weekly_rule` do dia da semana.
+2. Acrescenta os `one_off_slot` que começam na data.
+
+**Datas oferecidas ao cliente** (`GET /studios/{slug}/availability`, research.md R5): datas
+com alguma faixa que começa dentro de `[now + min_notice_hours, now + max_advance_days]`, num
+dia de `affiliation.weekdays` e com **ao menos 30 min livres** para o tatuador (capacidade da
+faixa, macas e sessões confirmadas dele em qualquer estúdio).
+
+**Intervalos livres para aprovar** (`GET /bookings/{id}/free-intervals`): união das faixas da
+data pedida menos os trechos sem capacidade, sem maca ou com sessão confirmada do tatuador,
+em blocos de 30 min.
 
 **Regras de edição (edge cases)**
-- Excluir `one_off_slot` ou reduzir capacidade (avulso ou override) abaixo de `booked` →
-  `409 slot_has_bookings`.
-- Editar `weekly_rule` ou bloquear uma data → permitido; agendamentos existentes são mantidos
-  (guardam o próprio intervalo) e as ocorrências afetadas deixam de aceitar novos.
+- Excluir `one_off_slot` com sessão confirmada dentro, ou reduzir a capacidade de uma faixa
+  (avulsa ou override) abaixo do pico de sessões confirmadas nela → `409 slot_has_bookings`.
+- Editar `weekly_rule` ou bloquear uma data → permitido; sessões confirmadas são mantidas
+  (guardam o próprio intervalo); pedidos pendentes de uma data sem faixas não podem ser
+  aprovados.
 
 ### booking (Agendamento)
 | Campo | Tipo | Regras |
@@ -258,66 +262,84 @@ Cálculo para um intervalo pedido, recortado pela janela do estúdio
 | id | uuid | PK |
 | studio_id | uuid | FK studio |
 | artist_id | uuid | FK artist_profile |
-| starts_at / ends_at | timestamptz | snapshot da ocorrência escolhida |
-| status | enum `pending` \| `confirmed` \| `declined` \| `expired` \| `cancelled` \| `completed` | |
+| requested_date | date | data local do estúdio pedida pelo cliente (FR-008) |
+| requested_window_start / requested_window_end | time | faixa preferida (snapshot da faixa escolhida) |
+| starts_at / ends_at | timestamptz? | **nulos até a aprovação**; definidos pelo tatuador (FR-008b): duração múltipla de 30 min, mínimo 30 min |
+| status | enum `pending` \| `confirmed` \| `declined` \| `expired` \| `cancelled` \| `completed` \| `no_show` | |
 | requested_at | timestamptz | |
-| expires_at | timestamptz | `min(requested_at + 48h, starts_at)` (FR-011b) |
+| expires_at | timestamptz | `min(requested_at + 48h, início da faixa pedida)`, sendo o início `requested_date` + `requested_window_start` no fuso do estúdio (FR-011b); recalculado na remarcação |
 | decided_at | timestamptz? | aprovação/recusa |
 | cancelled_at / cancelled_by | timestamptz? / enum `client` \| `artist` \| `studio`? | |
-| cancelled_by_user_id | uuid? | quem da equipe/tatuador/cliente cancelou (auditoria) |
+| cancelled_by_user_id | uuid? | quem cancelou (auditoria) |
+| no_show_marked_at / no_show_marked_by_user_id | timestamptz? / uuid? | FR-011e |
 | rescheduled_at | timestamptz? | última remarcação (FR-011d) |
 | reminder_sent_at | timestamptz? | lembrete de 24h enviado (FR-012a); zerado ao remarcar |
 | client_user_id | uuid? | FK user quando houver conta |
 | client_name / client_email / client_phone | text? | snapshot; obrigatórios enquanto `anonymized_at` for nulo |
 | client_email_norm / client_phone_norm | text? | normalizados para o limite de pendentes (FR-011c) |
-| guest_token_hash | bytea? | SHA-256 do token do link de acesso (visitante) |
+| guest_token_hash | bytea? | SHA-256 do token do link do visitante; trocado a cada "reenviar meu link" (research.md R24) |
 | description | text? | 1–1000 caracteres, obrigatória até a anonimização (FR-008a) |
 | body_location | enum | `braco`, `antebraco`, `mao`, `ombro`, `costas`, `peito`, `costela`, `abdomen`, `quadril`, `coxa`, `perna`, `panturrilha`, `pe`, `pescoco`, `rosto`, `outro` |
 | size | enum `P` \| `M` \| `G` | P até 5 cm, M 5–15 cm, G acima de 15 cm |
 | anonymized_at | timestamptz? | FR-019 |
 
-**Validações na criação** (FR-002a, FR-007a, FR-007c, FR-007d, FR-007e, FR-008, FR-008a,
-FR-009, FR-010, FR-011c)
+Check no banco: `status IN ('confirmed','completed','no_show')` ⇒ `starts_at` e `ends_at`
+não nulos; `status IN ('pending','declined','expired')` ⇒ ambos nulos; em `cancelled` ambos
+nulos ou ambos preenchidos (o status não guarda se veio de `pending` ou de `confirmed`).
+
+**Validações na criação e na remarcação** (FR-002a, FR-007d, FR-007e, FR-008, FR-008a, FR-009,
+FR-011c)
 - estúdio e tatuador obrigatórios, ambos **publicáveis**; vínculo `active` entre eles;
-- o cliente logado não é o próprio tatuador (`artist_profile.user_id ≠ client_user_id`);
-- o início está dentro da janela de antecedência e num dia de `affiliation.weekdays`;
-- `(starts_at, ends_at)` é uma ocorrência válida com `free > 0` (capacidade e macas, sob lock
-  do estúdio — research.md R4);
-- descrição, local do corpo e tamanho preenchidos; 0 a 3 imagens válidas;
+- o cliente logado não é o próprio tatuador (`self_booking`);
+- `requested_date` dentro da janela de antecedência, num dia de `affiliation.weekdays`, e a
+  faixa escolhida existe nessa data;
+- descrição, local do corpo e tamanho preenchidos; 0 a 3 imagens válidas (só na criação);
 - menos de 2 `pending` com o mesmo `client_email_norm` **ou** `client_phone_norm`, sob locks
-  do cliente;
-- sem agendamento ativo sobreposto do mesmo tatuador (constraint de exclusão).
+  do cliente (research.md R4). **Não há checagem de ocupação**: o pedido não reserva vaga.
+
+**Validações na aprovação** (FR-007a, FR-007c, FR-007d, FR-008b, FR-010), sob lock do estúdio
+- vínculo ainda `active` e estúdio/tatuador publicáveis;
+- `starts_at` na `requested_date` (local), no futuro, duração múltipla de 30 min ≥ 30 min;
+- intervalo inteiramente dentro das faixas da data (pode atravessar faixas contíguas);
+- para cada faixa tocada: pico de confirmadas sobrepostas + 1 ≤ capacidade;
+- pico de confirmadas do estúdio no intervalo + 1 ≤ `seats`;
+- sem sessão confirmada sobreposta do tatuador (constraint de exclusão).
 
 **Constraints e índices**
 - `EXCLUDE USING gist (artist_id WITH =, tstzrange(starts_at, ends_at) WITH &&)
-  WHERE status IN ('pending','confirmed')`
-- índices: `(studio_id, starts_at)`, `(artist_id, starts_at)`, `(status, expires_at)`,
+  WHERE status = 'confirmed'`
+- índices: `(studio_id, starts_at) WHERE status = 'confirmed'`, `(artist_id, starts_at)`,
+  `(studio_id, requested_date) WHERE status = 'pending'`, `(status, expires_at)`,
   `(client_user_id)`, `(client_email_norm) WHERE status = 'pending'`,
-  `(client_phone_norm) WHERE status = 'pending'`, `(status, starts_at) WHERE reminder_sent_at IS NULL`.
+  `(client_phone_norm) WHERE status = 'pending'`,
+  `(starts_at) WHERE status = 'confirmed' AND reminder_sent_at IS NULL`.
 
-**Transições** (ativos = `pending` + `confirmed`)
+**Transições**
 ```text
-            ┌─ tatuador aprova ──▶ confirmed ─┬─ cliente/tatuador/estúdio cancela ─▶ cancelled
-pending ────┼─ tatuador recusa ──▶ declined   └─ horário termina (Beat) ───────────▶ completed
-            ├─ 48h ou início do horário ─▶ expired
+            ┌─ tatuador aprova (define início e duração) ─▶ confirmed ─┬─ cancela (antes do início) ─▶ cancelled
+pending ────┼─ tatuador recusa ──▶ declined                             ├─ marca falta (0–7 dias após início) ─▶ no_show
+            ├─ 48h ou início da faixa pedida ─▶ expired                 └─ 7 dias após o início (Beat) ─▶ completed
             └─ cliente/tatuador/estúdio cancela ─▶ cancelled
 
-pending | confirmed ──cliente remarca (antes do início)──▶ pending (novo horário)
+pending | confirmed ──cliente remarca (antes da data / do início)──▶ pending (nova data e faixa)
+no_show ──desmarca (até 7 dias após o início)──▶ confirmed
 ```
-- `declined`, `expired`, `cancelled` e `completed` são finais e liberam a vaga.
-- **Cancelar** só com `now < starts_at`, senão `409 booking_started` (FR-011). Pelo lado do
-  estúdio, qualquer dono ou membro cancela, e a ação vai para o registro de ações.
-- **Remarcar (FR-011d)**: só o cliente (conta ou link), com `now < starts_at` atual, para
-  outra ocorrência do mesmo estúdio e tatuador. Atualiza `starts_at`, `ends_at`,
-  `requested_at = now`, `expires_at`, `decided_at = null`, `reminder_sent_at = null`,
-  `rescheduled_at = now`, `status = pending`. Mesmas validações da criação, excluindo o
-  próprio agendamento das contagens; falha → nada muda.
-- `completed` é aplicado pela task periódica `complete_past_bookings` após `ends_at`.
+- `declined`, `expired`, `cancelled` e `completed` são finais; `no_show` é final após 7 dias.
+- **Cancelar**: `pending` a qualquer momento; `confirmed` só com `now < starts_at`, senão
+  `409 booking_started` (FR-011). Pelo estúdio, dono ou membro; auditado.
+- **Remarcar (FR-011d)**: só o cliente (conta ou link). Atualiza `requested_date`, faixa,
+  `requested_at = now`, `expires_at`, e zera `starts_at`, `ends_at`, `decided_at`,
+  `reminder_sent_at`; `rescheduled_at = now`, `status = pending`.
+- **Falta (FR-011e)**: tatuador do agendamento ou dono/membro do estúdio, com
+  `starts_at ≤ now < starts_at + 7 dias`; pode ser desfeita na mesma janela; pelo estúdio é
+  auditada. Fora da janela → `409 no_show_window_closed`.
+- `completed` é aplicado pela task periódica `complete_past_bookings` a sessões `confirmed`
+  com `starts_at + 7 dias ≤ now`.
 
-**Anonimização (FR-019)**: 12 meses após `ends_at`, `client_name` → "Cliente anonimizado";
-`client_email`, `client_phone`, os normalizados, `description` e `guest_token_hash` → nulos;
-imagens de referência apagadas; `anonymized_at` preenchido. Data, estúdio, tatuador e status
-são mantidos.
+**Anonimização (FR-019)**: 12 meses após `ends_at` (ou após `requested_date` quando nunca
+houve intervalo), `client_name` → "Cliente anonimizado"; `client_email`, `client_phone`, os
+normalizados, `description` e `guest_token_hash` → nulos; imagens de referência apagadas;
+`anonymized_at` preenchido. Data, estúdio, tatuador e status são mantidos.
 
 ### booking_reference_image (FR-008a)
 | Campo | Tipo | Regras |
@@ -357,23 +379,25 @@ Ao menos um estilo por trabalho (FR-014). Remover o item apaga os objetos no Min
 | recipient_user_id | uuid? | destino in-app pessoal (tatuador, cliente com conta) |
 | studio_id | uuid? | destino in-app do estúdio: visível ao dono e aos membros (FR-024) |
 | recipient_email | citext | destino do e-mail (para o estúdio: e-mail do dono) |
-| type | enum | `booking_requested`, `booking_confirmed`, `booking_declined`, `booking_expired`, `booking_cancelled`, `booking_rescheduled`, `booking_reminder`, `artist_daily_digest`, `affiliation_invited`, `affiliation_expired`, `affiliation_ended`, `member_invited`, `email_verification`, `password_reset` |
+| type | enum | `booking_received`, `booking_requested`, `booking_confirmed`, `booking_declined`, `booking_expired`, `booking_cancelled`, `booking_rescheduled`, `booking_reminder`, `artist_daily_digest`, `guest_links`, `affiliation_invited`, `affiliation_expired`, `affiliation_ended`, `member_invited`, `email_verification`, `password_reset` |
 | booking_id / affiliation_id | uuid? | referência |
 | payload | jsonb? | dados do e-mail (ex.: lista do digest) |
 | read_at | timestamptz? | leitura in-app; para notificações de estúdio, leitura compartilhada pela equipe |
 | email_sent_at | timestamptz? | preenchido pela task `notifications.send_email`; não nulo = já enviado (idempotência) |
 | email_attempts | smallint | incrementado a cada tentativa da task |
-| email_failed_at | timestamptz? | tentativas esgotadas; mensagem foi para a dead-letter `email.dlq` |
+| email_failed_at | timestamptz? | tentativas esgotadas (dead-letter `email.dlq`) **ou** devolução detectada na caixa do Gmail (research.md R23) |
+| email_message_id | text? | `Message-ID` gerado no envio; liga a devolução (DSN) à notificação |
+| delivery_failure_reason | text? | motivo resumido (ex.: "endereço inexistente") |
 
-`booking_reminder`, `artist_daily_digest`, `member_invited`, `email_verification` e
-`password_reset` são só e-mail. A notificação e a respectiva `outbox_message`
+`booking_received`, `booking_reminder`, `artist_daily_digest`, `guest_links`,
+`member_invited`, `email_verification` e `password_reset` são só e-mail. A notificação e a respectiva `outbox_message`
 (`notifications.send_email`, `payload = {notification_id}`) são criadas **na mesma
 transação** do evento de negócio (FR-012, research.md R6).
 
 | Evento | Destinatários |
 |---|---|
-| agendamento criado / remarcado | tatuador (ação), estúdio |
-| aprovado | cliente, estúdio |
+| pedido criado / remarcado | cliente (`booking_received`, com o link de acesso se visitante), tatuador (`booking_requested`, ação), estúdio |
+| aprovado | cliente (com início e duração), estúdio |
 | recusado / expirado | cliente, estúdio |
 | cancelado | as duas outras partes |
 | lembrete 24h | cliente (FR-012a) |
@@ -383,6 +407,11 @@ transação** do evento de negócio (FR-012, research.md R6).
 | vínculo encerrado | a outra parte |
 | convite de membro | e-mail convidado |
 | verificação / recuperação de senha | a própria conta |
+| reenviar meu link | e-mail informado, com os links de todos os agendamentos ativos (`guest_links`, FR-002b) |
+
+**Aviso de e-mail não entregue (FR-002b)**: um agendamento mostra o aviso ao estúdio e ao
+tatuador quando existe notificação para o cliente desse agendamento com `email_failed_at`
+preenchido; a resposta da API traz `client_email_undelivered: true`.
 
 Notificações de agendamentos anonimizados têm `recipient_email` anonimizado também.
 

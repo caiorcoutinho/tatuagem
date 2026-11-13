@@ -29,13 +29,14 @@ uploads multipart) · **Fonte de verdade em runtime**: OpenAPI gerado pelo FastA
 | `artist_profile_exists` | conta que já tem perfil de tatuador tenta criar outro |
 | `affiliation_exists` | convite para par com vínculo `invited`/`active` |
 | `affiliation_inactive` | agendamento com tatuador sem vínculo ativo no estúdio |
-| `slot_unavailable` | horário inexistente, passado, bloqueado, fora da janela de antecedência, fora dos dias do tatuador, ou estúdio/tatuador não publicável |
-| `slot_full` | horário sem vagas (capacidade ou macas) |
-| `artist_unavailable` | tatuador já tem agendamento ativo sobreposto (qualquer estúdio) |
+| `slot_unavailable` | data/faixa inexistente, passada, bloqueada, fora da janela de antecedência, fora dos dias do tatuador, estúdio/tatuador não publicável; na aprovação, intervalo fora das faixas da data ou no passado |
+| `slot_full` | na aprovação: faixa sem capacidade ou estúdio sem maca livre no intervalo |
+| `artist_unavailable` | na aprovação: tatuador já tem sessão confirmada sobreposta (qualquer estúdio) |
+| `no_show_window_closed` | marcar/desmarcar falta antes do início ou mais de 7 dias depois |
 | `self_booking` | tatuador tentando agendar consigo mesmo |
-| `slot_has_bookings` | remover avulso/reduzir capacidade abaixo dos agendamentos ativos |
-| `seats_below_bookings` | reduzir macas abaixo do pico de agendamentos ativos simultâneos futuros |
-| `booking_started` | cancelar ou remarcar agendamento cujo horário já começou |
+| `slot_has_bookings` | remover faixa avulsa ou reduzir capacidade abaixo do pico de sessões confirmadas |
+| `seats_below_bookings` | reduzir macas abaixo do pico de sessões confirmadas simultâneas futuras |
+| `booking_started` | cancelar ou remarcar sessão confirmada que já começou |
 | `pending_limit_reached` | já existem 2 pedidos pendentes com o mesmo e-mail ou telefone (FR-011c) |
 | `invitation_not_valid` | convite (de vínculo ou de membro) expirado, cancelado, já respondido, ou de outro e-mail |
 | `invalid_transition` | mudança de status não permitida (ex.: aprovar agendamento expirado) |
@@ -115,7 +116,7 @@ O frontend monta o seletor de área a partir de `areas` (FR-003).
 | PUT | `/studios/{id}/schedule/rules` | member | `[WeeklyRule sem id]` → substitui o padrão · `400` se houver sobreposição entre regras ou `capacity > seats` |
 | PUT | `/studios/{id}/schedule/overrides/{date}` | member | `{blocked: true}` ou `{blocked: false, windows: [...]}` → `{override}` · `409 slot_has_bookings` |
 | DELETE | `/studios/{id}/schedule/overrides/{date}` | member | → `204` |
-| POST | `/studios/{id}/schedule/one-off-slots` | member | `{starts_at, ends_at, capacity}` → `201 {slot}` · `400` se `capacity > seats` |
+| POST | `/studios/{id}/schedule/one-off-slots` | member | `{starts_at, ends_at, capacity}` → `201 {slot}` (faixa avulsa) · `400` se `capacity > seats` |
 | PATCH | `/studios/{id}/schedule/one-off-slots/{sid}` | member | `{capacity}` → `{slot}` · `409 slot_has_bookings` |
 | DELETE | `/studios/{id}/schedule/one-off-slots/{sid}` | member | → `204` · `409 slot_has_bookings` |
 
@@ -123,35 +124,39 @@ O frontend monta o seletor de área a partir de `areas` (FR-003).
 
 | Método | Rota | Auth | Parâmetros → Resposta |
 |---|---|---|---|
-| GET | `/studios/{slug}/availability` | — | `artist` (slug, **obrigatório**, FR-009), `from`, `to` → `[Occurrence {starts_at, ends_at, free}]`, recortado pela janela de antecedência, pelos dias do tatuador e pela agenda dele em todos os estúdios · `400` sem `artist` · `409 affiliation_inactive` |
+| GET | `/studios/{slug}/availability` | — | `artist` (slug, **obrigatório**, FR-009), `from`, `to` (datas) → `[{date, windows: [{start_time, end_time}]}]`: datas e faixas oferecidas para pedido, já recortadas pela janela de antecedência, pelos dias do tatuador e por haver ao menos 30 min livres (research.md R5) · `400` sem `artist` · `409 affiliation_inactive` |
 
 ## Agendamentos
 
 | Método | Rota | Auth | Corpo → Resposta |
 |---|---|---|---|
-| POST | `/bookings` | — ou any | **multipart**: `studio_slug`, `artist_slug`, `starts_at`, `ends_at`, `description` (1–1000), `body_location`, `size` (`P`\|`M`\|`G`), `references` (0–3, JPEG/PNG/WebP ≤ 10 MB); visitante envia `client_name`, `client_email`, `client_phone` (conta logada usa os próprios dados) → `201 {booking}` (`pending`) · `400 validation_error`, `400 invalid_image`, `409 affiliation_inactive`, `slot_unavailable`, `slot_full`, `artist_unavailable`, `self_booking`, `pending_limit_reached` |
+| POST | `/bookings` | — ou any | **multipart**: `studio_slug`, `artist_slug`, `requested_date`, `window_start`, `window_end` (uma faixa devolvida pela disponibilidade), `description` (1–1000), `body_location`, `size` (`P`\|`M`\|`G`), `references` (0–3, JPEG/PNG/WebP ≤ 10 MB); visitante envia `client_name`, `client_email`, `client_phone` (conta logada usa os próprios dados) → `201 {booking, guest_access_url?}` (`pending`, **sem reserva**; `guest_access_url` só para visitante, só nesta resposta, FR-002b) · `400 validation_error`, `400 invalid_image`, `409 affiliation_inactive`, `slot_unavailable`, `self_booking`, `pending_limit_reached` |
 | GET | `/me/bookings` | any | `status?, from?, to?` + paginação → `[Booking]` em que a conta é cliente (FR-002a) |
 | GET | `/me/artist/bookings` | artist | `status?, from?, to?, studio?` + paginação → `[Booking]` de todos os estúdios (FR-013, US4) |
 | GET | `/studios/{id}/bookings` | member | `status?, from?, to?, artist?` + paginação → `[Booking]` do estúdio (FR-013) |
 | GET | `/bookings/{id}` | party | → `{booking}` |
-| POST | `/bookings/{id}/approve` | artist do agendamento | → `{booking}` (`confirmed`) · `409 invalid_transition` |
+| GET | `/bookings/{id}/free-intervals` | artist do agendamento | → `{date, windows: [...], free: [{start, end}]}`: intervalos livres da data pedida em blocos de 30 min (ajuda para aprovar, FR-008b) |
+| POST | `/bookings/{id}/approve` | artist do agendamento | `{starts_at, duration_minutes}` (múltiplo de 30, ≥ 30, na data pedida) → `{booking}` (`confirmed`) · `400 validation_error`, `409 invalid_transition`, `slot_unavailable` (fora das faixas, dia ou no passado), `slot_full` (capacidade ou macas), `artist_unavailable`, `affiliation_inactive` |
 | POST | `/bookings/{id}/decline` | artist do agendamento | → `{booking}` (`declined`) |
-| POST | `/bookings/{id}/cancel` | party | → `{booking}` (`cancelled`, `cancelled_by` conforme o lado de quem cancelou) · `409 booking_started` |
-| POST | `/bookings/{id}/reschedule` | cliente do agendamento | `{starts_at, ends_at}` → `{booking}` (`pending`, novo horário) · `409 booking_started`, `slot_unavailable`, `slot_full`, `artist_unavailable`, `pending_limit_reached`; em erro nada muda (FR-011d) |
+| POST | `/bookings/{id}/cancel` | party | `{side?}` → `{booking}` (`cancelled`) · `409 booking_started` (confirmado já iniciado) |
+| POST | `/bookings/{id}/reschedule` | cliente do agendamento | `{requested_date, window_start, window_end}` → `{booking}` (`pending`, nova preferência, intervalo anterior liberado) · `409 booking_started`, `slot_unavailable`, `pending_limit_reached` (FR-011d) |
+| POST | `/bookings/{id}/no-show` | artist do agendamento ou member | → `{booking}` (`no_show`) · `409 no_show_window_closed` (FR-011e) |
+| DELETE | `/bookings/{id}/no-show` | artist do agendamento ou member | → `{booking}` (`confirmed`) · `409 no_show_window_closed` |
 | GET | `/bookings/{id}/references/{n}` | party | → `image/webp` (streaming, `Cache-Control: private, no-store`) |
 | GET | `/guest/bookings/{token}` | guest-token | → `{booking}` |
 | POST | `/guest/bookings/{token}/cancel` | guest-token | → `{booking}` · `409 booking_started` |
 | POST | `/guest/bookings/{token}/reschedule` | guest-token | igual a `/bookings/{id}/reschedule` |
 | GET | `/guest/bookings/{token}/references/{n}` | guest-token | igual a `/bookings/{id}/references/{n}` |
+| POST | `/guest/resend-links` | — | `{email}` → sempre `204`; se houver agendamentos ativos para o e-mail, gera links novos e envia um único e-mail com todos (FR-002b, research.md R24) |
 
 Quando uma conta é parte por mais de um lado (ex.: tatuador que também é membro do
-estúdio), o lado usado no cancelamento é o do contexto da rota no frontend (`side` opcional
-no corpo: `client`\|`artist`\|`studio`; padrão: o primeiro lado válido nessa ordem).
+estúdio), o lado usado no cancelamento é informado em `side` (`client`\|`artist`\|`studio`;
+padrão: o primeiro lado válido nessa ordem).
 
-`Booking = {id, status, starts_at, ends_at, expires_at, studio: StudioSummary, artist: ArtistSummary, client: {name, email, phone}, description, body_location, size, references: [{n, url, width, height}], cancelled_by?, rescheduled_at?}`.
-Contato, detalhes e imagens só para as partes (FR-008a, FR-018). Anonimizados (FR-019):
-`client = {name: "Cliente anonimizado", email: null, phone: null}`, `description = null`,
-`references = []`.
+`Booking = {id, status, requested_date, requested_window: {start_time, end_time}, starts_at?, ends_at?, duration_minutes?, expires_at, studio: StudioSummary, artist: ArtistSummary, client: {name, email, phone}, client_email_undelivered, description, body_location, size, references: [{n, url, width, height}], cancelled_by?, rescheduled_at?, no_show_marked_at?}`.
+Contato, detalhes, imagens e `client_email_undelivered` só para as partes (FR-008a, FR-018,
+FR-002b). Anonimizados (FR-019): `client = {name: "Cliente anonimizado", email: null,
+phone: null}`, `description = null`, `references = []`.
 
 ## Portfólio (FR-014, FR-015)
 
@@ -184,4 +189,4 @@ Só perfis publicáveis aparecem; os demais retornam `404` nas páginas pública
 
 | Método | Rota | Auth | Resposta |
 |---|---|---|---|
-| GET | `/health` | — | `{status: "ok", db: "ok", storage: "ok", broker: "ok", outbox_backlog: <int>}` (`outbox_backlog` = mensagens não publicadas há mais de 1 min) |
+| GET | `/health` | — | `{status: "ok", db: "ok", storage: "ok", broker: "ok", mail: "ok"\|"error", mail_sent_today: <int>, outbox_backlog: <int>}` (`mail = error` quando a autorização do Gmail falhou; `outbox_backlog` = mensagens não publicadas há mais de 1 min) |

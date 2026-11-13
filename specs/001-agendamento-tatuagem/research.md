@@ -54,59 +54,66 @@ stack e resolvem os pontos em aberto do Technical Context.
 - **Alternatives considered**: JWT stateless (revogação difícil, sem benefício com um único
   backend); FastAPI-Users (traz mais do que o necessário e acopla o modelo de usuário).
 
-## R4. Concorrência: capacidade, macas e sobreposição
+## R4. Concorrência: pedido sem reserva, regras na aprovação
+
+Desde a clarificação de 2026-11-13, o **pedido não reserva vaga**: o cliente informa data e
+faixa preferidas, e o intervalo só passa a existir quando o tatuador aprova (FR-008b,
+FR-011a). Por isso as regras de ocupação ficam todas na **aprovação**.
 
 - **Decision**:
   1. **Sobreposição do tatuador (FR-010)**: constraint de exclusão no PostgreSQL com
      `btree_gist`: `EXCLUDE USING gist (artist_id WITH =, tstzrange(starts_at, ends_at) WITH &&)
-     WHERE (status IN ('pending','confirmed'))`. O banco garante a regra entre estúdios,
-     mesmo com requisições simultâneas.
-  2. **Capacidade do horário (FR-007a) e macas do estúdio (FR-007c)**: na transação de
-     criação, `pg_advisory_xact_lock` com chave derivada **só do `studio_id`** (todas as
-     reservas do estúdio são serializadas). Dentro do lock: (a) agendamentos ativos na mesma
-     ocorrência < capacidade da ocorrência; (b) o **pico** de agendamentos ativos do estúdio
-     que se sobrepõem ao intervalo pedido, somado ao novo, ≤ `seats` do estúdio. O pico é
-     calculado por varredura dos pontos de início dentro do intervalo (sweep line em SQL ou em
-     Python sobre os poucos agendamentos sobrepostos).
-  3. **Limite de pendentes por cliente (FR-011c)**: e-mail e telefone são normalizados
-     (e-mail em minúsculas sem espaços; telefone só dígitos, com DDI 55 quando ausente) e
-     guardados em colunas próprias indexadas. Como o limite vale entre estúdios, a transação
-     também pega `pg_advisory_xact_lock` das chaves do e-mail e do telefone normalizados.
-     **Ordem fixa dos locks**: chaves do cliente (ordenadas) → estúdio, para evitar deadlock.
-     Dentro dos locks: pendentes com o mesmo e-mail **ou** telefone < 2.
-  4. Violação → `409 Conflict` com código específico (`artist_unavailable`, `slot_full`,
-     `pending_limit_reached`). Alterar `seats` para menos que o pico futuro também usa o
-     lock do estúdio e retorna `409 seats_below_bookings`.
-  5. **Remarcação (FR-011d)** usa a mesma transação e os mesmos locks da criação, mas valida
-     o novo horário **excluindo o próprio agendamento** das contagens (ocorrência, pico,
-     pendentes); a linha é atualizada no lugar, e a constraint de exclusão valida o novo
-     intervalo. Se qualquer checagem falhar, o rollback mantém o horário original.
-- **Rationale**: atende SC-003 sem depender de checagens fora de transação. Com horários
-  sobrepostos (avulso sobre padrão), uma trava por `(studio_id, starts_at)` deixaria duas
-  reservas de inícios diferentes passarem juntas; a trava por estúdio fecha esse caso. A
-  contenção é aceitável: reservas de um mesmo estúdio são raras no mesmo milissegundo.
-- **Alternatives considered**: isolamento SERIALIZABLE em tudo (retries frequentes, mais
-  complexo); lock otimista com versão (exige linha materializada por horário — ver R5).
+     WHERE (status = 'confirmed')`. Pendentes não têm intervalo (`starts_at`/`ends_at` nulos)
+     e ficam fora da regra.
+  2. **Aprovação (FR-007a, FR-007c, FR-008b)**: transação com `pg_advisory_xact_lock` da
+     chave do **estúdio** (serializa aprovações do mesmo estúdio). Dentro do lock: (a) o
+     intervalo está inteiramente coberto pelas faixas da data (união de faixas contíguas);
+     (b) para cada faixa tocada, o pico de sessões confirmadas sobrepostas dentro dela + 1 ≤
+     capacidade da faixa; (c) o pico de sessões confirmadas do estúdio no intervalo + 1 ≤
+     `seats`; (d) dia da semana em `affiliation.weekdays` e início no futuro. Picos por
+     varredura dos limites dos intervalos (sweep line). Depois, `UPDATE` para `confirmed`; a
+     constraint de exclusão garante (FR-010) mesmo entre estúdios diferentes.
+  3. **Limite de pendentes por cliente (FR-011c)**: e-mail e telefone normalizados em colunas
+     próprias; na **criação** e na **remarcação**, `pg_advisory_xact_lock` das chaves do
+     e-mail e do telefone (ordenadas, para evitar deadlock) e checagem `< 2` pendentes com o
+     mesmo e-mail **ou** telefone. A criação não trava o estúdio (não há ocupação a checar).
+  4. Violação → `409` com código específico: `slot_unavailable` (fora das faixas, dia ou
+     janela), `slot_full` (capacidade ou macas), `artist_unavailable` (sobreposição),
+     `pending_limit_reached`. Alterar `seats` ou a capacidade de uma faixa abaixo do pico de
+     sessões confirmadas futuras usa o mesmo lock do estúdio → `409 seats_below_bookings` /
+     `slot_has_bookings`.
+  5. **Remarcação (FR-011d)**: só troca a preferência (data e faixa), volta a `pending` e
+     zera `starts_at`/`ends_at` (liberando o intervalo, se confirmado), numa transação com os
+     locks do cliente. Não há disputa de vaga, logo não falha por ocupação.
+- **Rationale**: atende SC-003 com as regras checadas sob lock no único momento em que um
+  intervalo passa a ocupar maca. A trava por estúdio cobre faixas sobrepostas com inícios
+  diferentes; a contenção é baixa (aprovações de um mesmo estúdio no mesmo instante são raras).
+- **Alternatives considered**: reservar uma duração padrão no pedido (rejeitado na
+  clarificação: o tatuador define a duração); isolamento SERIALIZABLE em tudo (retries
+  frequentes).
 
-## R5. Modelo de horários: padrão semanal + exceções
+## R5. Faixas de atendimento: padrão semanal + exceções (FR-007, FR-007b)
 
-- **Decision**: ocorrências **calculadas sob demanda**, não materializadas:
+- **Decision**: faixas **calculadas sob demanda**, não materializadas:
   - `weekly_rule` (dia da semana, hora início/fim no fuso do estúdio, capacidade);
-  - `date_override` (data específica: bloqueada, ou faixas/capacidade substitutas);
-  - `one_off_slot` (horário avulso extra com início/fim/capacidade).
-  O serviço de disponibilidade gera as ocorrências de um intervalo (limitado à janela de
-  antecedência do estúdio, FR-007e — R21) aplicando
-  regras → overrides → avulsos e calcula as vagas livres de cada ocorrência como
-  `min(capacidade − ativos na ocorrência, seats − pico de ativos sobrepostos)` (FR-007c).
-  Horários podem se sobrepor; a capacidade de cada um MUST ser ≤ `seats`. O agendamento guarda
-  `starts_at`/`ends_at` (snapshot), então mudanças no padrão não afetam agendamentos já
-  feitos (edge case da spec).
-- **Rationale**: atende FR-007b sem job de geração de horários nem limpeza de linhas futuras;
-  alterar o padrão é uma edição simples.
-- **Alternatives considered**: materializar ocorrências para N semanas (precisa de job
-  recorrente, migração em massa ao editar o padrão e reconciliação com agendamentos).
-- **Fuso horário**: cada estúdio tem `timezone` IANA; regras em hora local, conversão com
-  `zoneinfo` (stdlib); armazenamento em UTC (`timestamptz`).
+  - `date_override` (data específica: bloqueada, ou faixas substitutas);
+  - `one_off_slot` (faixa avulsa com início/fim/capacidade).
+  Dois cálculos usam essas faixas:
+  - **Datas oferecidas ao cliente** (`GET /studios/{slug}/availability`): para cada data na
+    janela de antecedência (R21) e num dia de atendimento do tatuador, lista as faixas da data
+    que ainda têm **ao menos 30 min livres** para aquele tatuador (capacidade, macas e agenda
+    confirmada dele em qualquer estúdio). Datas sem nenhuma faixa assim não aparecem.
+  - **Intervalos livres para a aprovação** (`GET /bookings/{id}/free-intervals`): para a data
+    pedida, a união das faixas recortada pelas ocupações (capacidade, macas, sessões do
+    tatuador), em blocos de 30 min. É uma ajuda de tela; a validação definitiva é a do R4.
+  O agendamento confirmado guarda o próprio intervalo, então mudanças nas faixas não afetam
+  sessões confirmadas. Pedidos pendentes para uma data que ficou sem faixas simplesmente não
+  podem ser aprovados.
+- **Rationale**: atende FR-007b sem job de geração nem limpeza de linhas futuras.
+- **Alternatives considered**: materializar faixas por N semanas (job recorrente e
+  reconciliação ao editar o padrão).
+- **Fuso horário**: `timezone` IANA por estúdio; faixas em hora local, conversão com
+  `zoneinfo`; armazenamento em UTC (`timestamptz`); `requested_date` é data local do estúdio.
 
 ## R6. Mensageria: outbox transacional + RabbitMQ + Celery
 
@@ -137,9 +144,9 @@ stack e resolvem os pontos em aberto do Technical Context.
      `America/Sao_Paulo`, R22), `anonymize_old_bookings` e `purge_audit_log` (1 h). As
      periódicas fazem a mudança de negócio e as notificações numa transação e, como as
      demais, **enfileiram e-mails pelo outbox** em vez de enviá-los.
-  `expires_at = min(requested_at + 48h, starts_at)` é calculado na criação. A criação de
-  agendamento também expira, na mesma transação, pendentes vencidos do mesmo
-  tatuador/horário, para que a constraint de exclusão não bloqueie por pendente já vencido.
+  `expires_at = min(requested_at + 48h, início da faixa pedida)` é calculado na criação e
+  na remarcação (FR-011b, R15). A aprovação também recusa (`invalid_transition`) um pedido
+  com `expires_at <= now` ainda não processado pela task, sem depender do Beat.
 - **Filas**: `email` (envio), `default` (demais tasks), `email.dlq` (dead-letter, via
   `x-dead-letter-exchange` do RabbitMQ). Prefetch 1 nos workers de e-mail (tarefas lentas de
   I/O).
@@ -161,7 +168,8 @@ stack e resolvem os pontos em aberto do Technical Context.
   fake em memória). Testes de integração verificam que a linha de outbox nasce/morre com a
   transação de negócio e chamam os handlers das tasks diretamente; um teste de fumaça no CI
   sobe RabbitMQ e um worker real para um envio ponta a ponta até o Mailpit.
-- **E-mail**: SMTP via `aiosmtplib` dentro da task; em desenvolvimento, Mailpit no compose.
+- **E-mail**: envio pela API do Gmail em produção e por SMTP para o Mailpit em
+  desenvolvimento, atrás do mesmo `Mailer` (R23).
 
 ## R7. Imagens do portfólio com MinIO
 
@@ -263,7 +271,9 @@ stack e resolvem os pontos em aberto do Technical Context.
     varre as rotas públicas garantindo ausência de e-mail/telefone.
   - **Anonimização (FR-019)**: task periódica `anonymize_old_bookings` no Celery Beat (uma vez por hora, R6)
     substitui `client_name` por "Cliente anonimizado", zera e-mail/telefone/notas e o
-    `guest_token_hash` de agendamentos com `ends_at <= now() − 12 meses`, marcando
+    `guest_token_hash` de agendamentos encerrados há 12 meses: `ends_at <= now() − 12
+    meses` para os que tiveram sessão, ou fim da `requested_date` `<= now() − 12 meses` para
+    os que nunca foram confirmados (recusados, expirados, cancelados pendentes), marcando
     `anonymized_at`. Notificações desses agendamentos têm `recipient_email` anonimizado.
   - **Exclusão de estúdio (FR-020a)**: `DELETE /studios/{id}` (dono, confirmação de senha):
     cancela agendamentos futuros ativos do estúdio (`cancelled_by = studio`), encerra
@@ -284,10 +294,21 @@ stack e resolvem os pontos em aberto do Technical Context.
 - **Alternatives considered**: `DELETE` em cascata (apagaria o histórico das outras partes);
   exclusão só via suporte (rejeitada na clarificação).
 
-## R15. Cancelamento (FR-011)
+## R15. Expiração, cancelamento e falta (FR-011, FR-011b, FR-011e)
 
-- **Decision**: a transição `cancel` exige `now < starts_at` (relógio injetado); caso
-  contrário `409 booking_started`. Vale para cliente, tatuador, estúdio e link de visitante.
+- **Expiração**: `expires_at = min(requested_at + 48h, início da faixa pedida)`, com o início
+  da faixa calculado em `requested_date` + `requested_window_start` no fuso do estúdio.
+  Funciona para pedidos do mesmo dia (antecedência mínima 0h): um pedido às 10h para a faixa
+  14:00–18:00 de hoje expira às 14:00. Substitui a regra provisória "00h da data pedida"
+  (clarificação de 2026-11-13).
+- **Decision**: `cancel` de `pending` é sempre permitido enquanto pendente; de `confirmed`
+  exige `now < starts_at`, senão `409 booking_started`. Vale para cliente, tatuador, estúdio
+  e link de visitante.
+- **Falta**: `mark_no_show` (tatuador do agendamento ou dono/membro do estúdio) exige
+  `confirmed` e `starts_at <= now < starts_at + 7 dias` (`409 no_show_window_closed` fora
+  disso); `unmark_no_show` volta a `confirmed` na mesma janela. A task periódica
+  `complete_past_bookings` passa para `completed` as sessões `confirmed` com
+  `starts_at + 7 dias <= now`. Marcações do lado do estúdio são auditadas.
 
 ## R16. Detalhes do pedido e imagens de referência (FR-008a)
 
@@ -297,8 +318,8 @@ stack e resolvem os pontos em aberto do Technical Context.
     (`P`/`M`/`G`) são obrigatórios.
   - As imagens passam pelo mesmo processamento do portfólio (R7: Pillow, tipo real, ≤ 10 MB,
     EXIF removido), mas geram **uma** variante WebP (largura máx. 1600 px). O processamento
-    acontece **antes** de abrir a transação e dos locks, para não segurar o lock do estúdio
-    durante trabalho de CPU.
+    acontece **antes** de abrir a transação e dos locks do cliente (R4), para não segurar
+    locks durante trabalho de CPU.
   - Ficam num bucket **privado** `booking-refs` (sem política anônima, não exposto pelo
     nginx), na chave `booking-refs/{booking_id}/{n}.webp`. O upload ao storage ocorre dentro
     do fluxo de criação antes do commit; se a transação falhar, o prefixo é apagado no
@@ -388,10 +409,10 @@ stack e resolvem os pontos em aberto do Technical Context.
 
 - **Decision**: `affiliation.weekdays` (smallint bitmask, 7 bits, padrão 127 = todos) e
   `studio.min_notice_hours` (0–72, padrão 24) e `studio.max_advance_days` (7–180, padrão
-  60). A disponibilidade filtra ocorrências pelo dia da semana **local do estúdio** do
-  início do horário e pela janela `[now + min_notice, now + max_advance]`; criação e
-  remarcação revalidam os dois dentro da transação (código `slot_unavailable`). Alterações
-  não tocam agendamentos existentes.
+  60). As datas oferecidas são filtradas pelo dia da semana (local do estúdio) e pela janela:
+  uma data entra se alguma faixa dela começa em `[now + min_notice, now + max_advance]`.
+  Criação e remarcação revalidam a data pedida; a aprovação revalida o dia da semana e exige
+  início no futuro (código `slot_unavailable`). Alterações não tocam agendamentos existentes.
 - **Rationale**: bitmask é compacto, fácil de indexar/validar e de exibir como 7 checkboxes.
 
 ## R22. Lembretes (FR-012a)
@@ -410,3 +431,54 @@ stack e resolvem os pontos em aberto do Technical Context.
 - **Rationale**: marcas de envio na própria linha/tabela tornam as tasks idempotentes mesmo
   com reentrega do RabbitMQ ou restart do Beat; a janela de 1h dos lembretes tolera atrasos
   de execução.
+
+## R23. E-mail pela API do Gmail (conta pessoal no MVP)
+
+- **Decision**: `Mailer` ganha duas implementações: `GmailApiMailer` (produção) e
+  `SmtpMailer` (desenvolvimento e testes, apontando para o Mailpit). O `GmailApiMailer`
+  monta a mensagem MIME (stdlib `email`) e chama
+  `POST https://gmail.googleapis.com/gmail/v1/users/me/messages/send` com `httpx`, usando um
+  access token obtido do **refresh token** OAuth da conta @gmail.com pelo `google-auth`.
+  - **Autorização**: app OAuth no Google Cloud com escopos `gmail.send` e `gmail.modify`,
+    em status **"In production"** (em "Testing" o refresh token expira em 7 dias). Para uso
+    só pela conta do próprio projeto, o app fica não verificado e o consentimento único
+    aceita o aviso do Google. O refresh token é obtido uma vez pelo script
+    `python -m app.tools.gmail_authorize` e guardado como segredo (`GMAIL_REFRESH_TOKEN`),
+    nunca versionado.
+  - **Cota (cerca de 500 destinatários/dia em conta pessoal)**: erros de cota
+    (`rateLimitExceeded`, `dailyLimitExceeded`, HTTP 429) não contam como falha: a task se
+    reagenda com `countdown` crescente até 1 h, sem consumir as 6 tentativas de falha real.
+    A ordem aproximada de envio é a de criação (fila FIFO do RabbitMQ). Um contador diário
+    exposto no `/health` (`mail_sent_today`) mostra a proximidade do limite.
+  - **Falha de autorização** (`invalid_grant`): a task não re-tenta em loop; registra erro,
+    marca `/health` com `mail: "error"` e as mensagens ficam na fila até o token ser
+    renovado.
+- **Detecção de devoluções (FR-002b)**: cada e-mail sai com um cabeçalho `Message-ID`
+  gerado pelo sistema e guardado em `notification.email_message_id`. A task periódica
+  `notifications.scan_bounces` (a cada 10 min) consulta a caixa com
+  `from:mailer-daemon@googlemail.com newer_than:3d -label:tatuagem-processado`, extrai o
+  `Message-ID` original do relatório de entrega (DSN), marca `email_failed_at` e
+  `delivery_failure_reason` na notificação e aplica o rótulo `tatuagem-processado`. Uma
+  notificação de cliente com falha faz o agendamento exibir o aviso "e-mail do cliente não
+  entregue" ao estúdio e ao tatuador.
+- **Rationale**: atende a decisão do usuário (Gmail no MVP) com uma dependência pequena
+  (`google-auth` só para renovar tokens; `httpx` já é usado nos testes e passa a ser
+  dependência de produção) em vez do SDK completo `google-api-python-client`. Manter o
+  `SmtpMailer` permite rodar tudo localmente sem conta Google.
+- **Alternatives considered**: SMTP do Gmail com senha de app (exige verificação em duas
+  etapas e não dá acesso estruturado à caixa para ler devoluções); provedor transacional
+  (SES, Postmark, Resend: adiado para depois do MVP, junto com domínio próprio).
+- **Riscos aceitos**: limite diário baixo; termos do Google não preveem envio automatizado
+  de produto por conta pessoal (risco de bloqueio da conta); remetente @gmail.com.
+
+## R24. Recuperação do link do visitante (FR-002b)
+
+- **Decision**: a resposta de `POST /bookings` para visitante inclui `guest_access_url`
+  (exibido só nessa resposta, com botão de copiar na tela de confirmação). Os tokens de
+  acesso continuam guardados só como hash; para reenviar, o sistema **gera um novo token**
+  para cada agendamento ativo (`pending` ou `confirmed`) daquele e-mail, invalidando o
+  anterior, e manda um único e-mail com todos os links (`POST /guest/resend-links`,
+  resposta sempre `204`; limitado no nginx). O e-mail de criação do pedido
+  (`booking_received`) também carrega o link.
+- **Rationale**: o link nunca precisa ser armazenado em texto aberto; quem tem acesso ao
+  e-mail recupera o acesso, e mais ninguém.
