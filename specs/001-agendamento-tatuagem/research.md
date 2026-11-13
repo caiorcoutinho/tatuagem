@@ -11,7 +11,8 @@ stack e resolvem os pontos em aberto do Technical Context.
 ## R1. Backend: FastAPI + camada de dados
 
 - **Decision**: Python 3.12, FastAPI, Pydantic v2 (+ pydantic-settings), SQLAlchemy 2.0
-  assíncrono com asyncpg, Alembic para migrações. Servido por Uvicorn.
+  assíncrono com asyncpg, Alembic para migrações. Servido por Uvicorn. `python-multipart`
+  é exigido pelo próprio FastAPI para receber `multipart/form-data` (upload de imagens).
 - **Rationale**: SQLAlchemy 2.0 é o ORM padrão do ecossistema FastAPI e permite descer para
   SQL quando necessário (constraints de exclusão, advisory locks — ver R4). Alembic dá
   migrações versionadas e revisáveis.
@@ -30,6 +31,8 @@ stack e resolvem os pontos em aberto do Technical Context.
 - **Alternatives considered**: Next.js (descartado: usuário definiu FastAPI como backend);
   Redux (desnecessário — quase todo o estado é de servidor); MUI/Chakra (mais peso, menos
   controle visual para um produto centrado em imagens).
+- **`@hookform/resolvers`**: adaptador oficial que liga os schemas Zod ao React Hook Form;
+  sem ele seria preciso escrever a ponte de validação à mão em cada formulário.
 - **Grade de portfólio (estilo mural)**: CSS `columns` (masonry nativo) com imagens em
   dimensões conhecidas (largura/altura salvas no upload) para evitar layout shift; lazy
   loading nativo (`loading="lazy"`). Sem biblioteca de masonry.
@@ -42,27 +45,46 @@ stack e resolvem os pontos em aberto do Technical Context.
   então não há CORS.
 - **CSRF**: mutações exigem `Content-Type: application/json` (ou multipart para upload) e
   validação do header `Origin` contra o domínio configurado.
-- **Autorização**: dependências FastAPI por papel (`require_role(STUDIO)`) e checagens de
-  posse no serviço (ex.: só o tatuador do agendamento aprova).
+- **Autorização**: por **recurso**, não por papel da conta (a conta não tem papel fixo — ver
+  R19). Dependências FastAPI: `current_user`; `require_artist` (conta tem perfil de
+  tatuador); `studio_access(studio_id, level)` com `level` = `member` (dono ou membro) ou
+  `owner`. Checagens de posse no serviço (ex.: só o tatuador do agendamento aprova).
 - **Rationale**: sessão opaca é revogável (logout, troca de senha), evita armazenar JWT no
   browser e é simples com mesmo domínio.
 - **Alternatives considered**: JWT stateless (revogação difícil, sem benefício com um único
   backend); FastAPI-Users (traz mais do que o necessário e acopla o modelo de usuário).
 
-## R4. Concorrência: capacidade e sobreposição
+## R4. Concorrência: capacidade, macas e sobreposição
 
 - **Decision**:
   1. **Sobreposição do tatuador (FR-010)**: constraint de exclusão no PostgreSQL com
      `btree_gist`: `EXCLUDE USING gist (artist_id WITH =, tstzrange(starts_at, ends_at) WITH &&)
      WHERE (status IN ('pending','confirmed'))`. O banco garante a regra entre estúdios,
      mesmo com requisições simultâneas.
-  2. **Capacidade do horário (FR-007a)**: na transação de criação, `pg_advisory_xact_lock`
-     com chave derivada de `(studio_id, starts_at)`, contagem dos agendamentos ativos e
-     comparação com a capacidade da ocorrência.
-  3. Violação de qualquer um → `409 Conflict` com código de erro específico
-     (`artist_unavailable`, `slot_full`).
-- **Rationale**: atende SC-003 (0% de sobreposição) sem depender de checagens na aplicação,
-  que falham sob concorrência. Advisory lock serializa só o horário disputado.
+  2. **Capacidade do horário (FR-007a) e macas do estúdio (FR-007c)**: na transação de
+     criação, `pg_advisory_xact_lock` com chave derivada **só do `studio_id`** (todas as
+     reservas do estúdio são serializadas). Dentro do lock: (a) agendamentos ativos na mesma
+     ocorrência < capacidade da ocorrência; (b) o **pico** de agendamentos ativos do estúdio
+     que se sobrepõem ao intervalo pedido, somado ao novo, ≤ `seats` do estúdio. O pico é
+     calculado por varredura dos pontos de início dentro do intervalo (sweep line em SQL ou em
+     Python sobre os poucos agendamentos sobrepostos).
+  3. **Limite de pendentes por cliente (FR-011c)**: e-mail e telefone são normalizados
+     (e-mail em minúsculas sem espaços; telefone só dígitos, com DDI 55 quando ausente) e
+     guardados em colunas próprias indexadas. Como o limite vale entre estúdios, a transação
+     também pega `pg_advisory_xact_lock` das chaves do e-mail e do telefone normalizados.
+     **Ordem fixa dos locks**: chaves do cliente (ordenadas) → estúdio, para evitar deadlock.
+     Dentro dos locks: pendentes com o mesmo e-mail **ou** telefone < 2.
+  4. Violação → `409 Conflict` com código específico (`artist_unavailable`, `slot_full`,
+     `pending_limit_reached`). Alterar `seats` para menos que o pico futuro também usa o
+     lock do estúdio e retorna `409 seats_below_bookings`.
+  5. **Remarcação (FR-011d)** usa a mesma transação e os mesmos locks da criação, mas valida
+     o novo horário **excluindo o próprio agendamento** das contagens (ocorrência, pico,
+     pendentes); a linha é atualizada no lugar, e a constraint de exclusão valida o novo
+     intervalo. Se qualquer checagem falhar, o rollback mantém o horário original.
+- **Rationale**: atende SC-003 sem depender de checagens fora de transação. Com horários
+  sobrepostos (avulso sobre padrão), uma trava por `(studio_id, starts_at)` deixaria duas
+  reservas de inícios diferentes passarem juntas; a trava por estúdio fecha esse caso. A
+  contenção é aceitável: reservas de um mesmo estúdio são raras no mesmo milissegundo.
 - **Alternatives considered**: isolamento SERIALIZABLE em tudo (retries frequentes, mais
   complexo); lock otimista com versão (exige linha materializada por horário — ver R5).
 
@@ -72,8 +94,11 @@ stack e resolvem os pontos em aberto do Technical Context.
   - `weekly_rule` (dia da semana, hora início/fim no fuso do estúdio, capacidade);
   - `date_override` (data específica: bloqueada, ou faixas/capacidade substitutas);
   - `one_off_slot` (horário avulso extra com início/fim/capacidade).
-  O serviço de disponibilidade gera as ocorrências de um intervalo (máx. 60 dias) aplicando
-  regras → overrides → avulsos e subtrai agendamentos ativos. O agendamento guarda
+  O serviço de disponibilidade gera as ocorrências de um intervalo (limitado à janela de
+  antecedência do estúdio, FR-007e — R21) aplicando
+  regras → overrides → avulsos e calcula as vagas livres de cada ocorrência como
+  `min(capacidade − ativos na ocorrência, seats − pico de ativos sobrepostos)` (FR-007c).
+  Horários podem se sobrepor; a capacidade de cada um MUST ser ≤ `seats`. O agendamento guarda
   `starts_at`/`ends_at` (snapshot), então mudanças no padrão não afetam agendamentos já
   feitos (edge case da spec).
 - **Rationale**: atende FR-007b sem job de geração de horários nem limpeza de linhas futuras;
@@ -83,27 +108,64 @@ stack e resolvem os pontos em aberto do Technical Context.
 - **Fuso horário**: cada estúdio tem `timezone` IANA; regras em hora local, conversão com
   `zoneinfo` (stdlib); armazenamento em UTC (`timestamptz`).
 
-## R6. Expiração de pendentes e envio de e-mails
+## R6. Mensageria: outbox transacional + RabbitMQ + Celery
 
-- **Decision**: um processo **worker** (mesma imagem do backend, comando diferente no
-  compose) roda em loop a cada 60 s:
-  1. marca como `expired` os agendamentos `pending` com `expires_at <= now()` e cria as
-     notificações;
-  2. envia e-mails das notificações com `email_sent_at IS NULL` (padrão outbox), com até 5
-     tentativas.
-  `expires_at = min(requested_at + 48h, starts_at)` é calculado na criação. Além disso, a
-  criação de agendamento expira, na mesma transação, pendentes vencidos do mesmo
+- **Decision**: processamento assíncrono com **Celery** (workers e Beat) sobre **RabbitMQ**,
+  alimentado por um **outbox transacional** no PostgreSQL:
+  1. **Produtor (API)**: o caso de uso grava a mudança de negócio, a `notification` (in-app +
+     dados do e-mail) e uma linha em `outbox_message` (`task` + `payload` JSON) **na mesma
+     transação** do SQLAlchemy. Nunca publica direto no broker: ou tudo é commitado, ou
+     nada é. Um único serviço `Outbox.enqueue(session, message)` monta a linha; os casos
+     de uso não conhecem o Celery.
+  2. **Relay (`python -m app.outbox_relay`)**: processo dedicado que, a cada 1 s, lê até 100
+     mensagens com `published_at IS NULL` usando `SELECT ... FOR UPDATE SKIP LOCKED`,
+     publica cada uma no RabbitMQ (`send_task` do Celery com **publisher confirms**,
+     `confirm_publish=True`) e marca `published_at` na mesma transação da leitura. Falha
+     ao publicar → rollback, a linha continua pendente e é retentada. `SKIP LOCKED`
+     permite mais de uma réplica do relay sem duplicar envio.
+  3. **Consumidores (Celery workers)**: tasks por módulo (ex.:
+     `notifications.send_email`). Entrega **at-least-once**: `acks_late=True`,
+     `task_reject_on_worker_lost=True`, filas duráveis e mensagens persistentes. Toda task é
+     **idempotente**: `send_email` relê a `notification` com `FOR UPDATE SKIP LOCKED` e
+     ignora se `email_sent_at` já está preenchido. Falhas de SMTP usam `autoretry_for` com
+     **backoff exponencial** (30 s → ~30 min, com jitter), até 6 tentativas; esgotadas, a
+     mensagem vai para uma **dead-letter queue** (`email.dlq`) e a notificação fica com
+     `email_failed_at`, visível nos logs/alerta.
+  4. **Tarefas periódicas (Celery Beat, instância única)**: `expire_pending_bookings` e
+     `expire_affiliation_invites` (1 min), `complete_past_bookings` (5 min),
+     `send_client_reminders` (5 min, R22), `send_artist_daily_digest` (18:00
+     `America/Sao_Paulo`, R22), `anonymize_old_bookings` e `purge_audit_log` (1 h). As
+     periódicas fazem a mudança de negócio e as notificações numa transação e, como as
+     demais, **enfileiram e-mails pelo outbox** em vez de enviá-los.
+  `expires_at = min(requested_at + 48h, starts_at)` é calculado na criação. A criação de
+  agendamento também expira, na mesma transação, pendentes vencidos do mesmo
   tatuador/horário, para que a constraint de exclusão não bloqueie por pendente já vencido.
-- **Rationale**: notificação gravada na mesma transação do evento não se perde se o SMTP
-  falhar (FR-012). Um único worker simples evita fila externa.
-- **Alternatives considered**: Celery/RQ + Redis (infra extra sem necessidade no volume da
-  v1); `BackgroundTasks` do FastAPI (perde e-mails em restart); pg_cron (acopla regra de
-  negócio ao banco).
-- **E-mail**: SMTP via `aiosmtplib`; em desenvolvimento, Mailpit no compose.
+- **Filas**: `email` (envio), `default` (demais tasks), `email.dlq` (dead-letter, via
+  `x-dead-letter-exchange` do RabbitMQ). Prefetch 1 nos workers de e-mail (tarefas lentas de
+  I/O).
+- **Celery com código assíncrono**: tasks do Celery são síncronas; o handler de cada task
+  roda o caso de uso assíncrono existente com `asyncio.run(...)`, usando um engine
+  SQLAlchemy com `NullPool` no worker (evita pool preso a um event loop). Assim os mesmos
+  repositórios e serviços servem à API e aos workers, sem uma segunda camada síncrona
+  (Princípio I, sem duplicação).
+- **Rationale**: o outbox garante atomicidade entre o dado e a mensagem (sem "salvou mas não
+  publicou" nem "publicou mas deu rollback"), e o RabbitMQ + Celery trazem retentativa com
+  backoff, dead-letter, escala horizontal de consumidores e agendamento de periódicas sem
+  escrever essa infraestrutura à mão.
+- **Alternatives considered**: worker caseiro com loop `asyncio` lendo o Postgres (plano
+  anterior; trocado por decisão do usuário em 2026-11-13 em favor de uma mensageria
+  padrão); publicar no RabbitMQ direto da requisição (perde a atomicidade com o banco);
+  Redis como broker (sem dead-letter nativo e sem garantias de persistência equivalentes);
+  `BackgroundTasks` do FastAPI (perde mensagens em restart).
+- **Testes**: o relay publica por um `Protocol` `TaskPublisher` (produção: Celery; testes:
+  fake em memória). Testes de integração verificam que a linha de outbox nasce/morre com a
+  transação de negócio e chamam os handlers das tasks diretamente; um teste de fumaça no CI
+  sobe RabbitMQ e um worker real para um envio ponta a ponta até o Mailpit.
+- **E-mail**: SMTP via `aiosmtplib` dentro da task; em desenvolvimento, Mailpit no compose.
 
 ## R7. Imagens do portfólio com MinIO
 
-- **Decision**: upload multipart pela API (`POST /api/portfolio/items`), limite 10 MB,
+- **Decision**: upload multipart pela API (`POST /api/v1/me/artist/portfolio`), limite 10 MB,
   formatos JPEG/PNG/WebP. O backend valida com Pillow (tipo real, não só extensão; remove
   EXIF), gera duas variantes WebP — `thumb` (largura 600 px) e `full` (largura máx. 1600 px)
   — e grava no bucket `portfolio` do MinIO via `boto3` (API S3). O bucket tem política de
@@ -130,6 +192,8 @@ stack e resolvem os pontos em aberto do Technical Context.
 
 - **Decision**: consultas SQL com filtros: cidade (igualdade normalizada), estilo (join por
   tabela de estilos) e nome (`ILIKE` com índice trigram `pg_trgm`). Paginação por cursor.
+  Estúdio por estilo (FR-017): `EXISTS` sobre `affiliation` ativa + `artist_style` do
+  tatuador, sem coluna de estilo no estúdio (sempre coerente com os vínculos).
 - **Rationale**: volume da v1 não justifica motor de busca dedicado.
 - **Alternatives considered**: Elasticsearch/Meilisearch (infra extra, YAGNI).
 
@@ -137,12 +201,12 @@ stack e resolvem os pontos em aberto do Technical Context.
 
 - **Decision**: ao criar um agendamento como visitante, gera token aleatório de 32 bytes;
   só o hash SHA-256 é salvo no agendamento. O e-mail traz
-  `/agendamentos/acesso/{token}`, que permite ver e cancelar aquele agendamento. Ao criar
-  conta Cliente com e-mail verificado, agendamentos com o mesmo e-mail são associados
-  (FR-002a).
+  `/agendamentos/acesso/{token}`, que permite ver, remarcar e cancelar aquele agendamento.
+  Quando **qualquer conta** verifica o e-mail, agendamentos de visitante com o mesmo e-mail
+  são associados a ela (FR-002a).
 - **Rationale**: o token vazado não compromete outros agendamentos; associar só após
   verificação do e-mail impede que alguém "tome" agendamentos de outra pessoa.
-- **Consequência**: contas Cliente exigem verificação de e-mail antes da associação.
+- **Consequência**: a associação só acontece após a verificação do e-mail da conta.
 
 ## R11. Qualidade e testes (Constituição)
 
@@ -151,17 +215,198 @@ stack e resolvem os pontos em aberto do Technical Context.
     `pytest-asyncio` + `httpx.AsyncClient`; testes de integração contra PostgreSQL real
     (container do compose de teste).
   - Frontend: ESLint + Prettier, Vitest + Testing Library; Playwright para e2e em dois
-    viewports (mobile 390×844 e desktop 1440×900).
+    viewports (mobile 390×844 e desktop 1440×900). `@axe-core/playwright` roda checagens
+    automáticas de acessibilidade (contraste, labels) nos mesmos testes e2e, cobrindo o
+    mínimo definido em contracts/ui-routes.md sem auditoria manual a cada mudança.
   - Repositório: `pre-commit` com hooks de ruff, eslint/prettier e
     `conventional-pre-commit` (validação de commits Angular); GitHub Actions rodando lint,
     testes e e2e.
 - **Rationale**: cobre os itens obrigatórios de "Padrões de Qualidade" (lint/format no
   pre-commit e CI, validação de mensagem de commit, testes de regra de negócio).
+- **Abstrações (Princípios III e V)**: `Protocol` apenas onde há duas implementações reais:
+  `Clock`, `ObjectStorage` e `Mailer` (produção + fake de teste) e os providers entre
+  módulos (`BookedCountProvider`, `ArtistBusyProvider`). Repositórios são classes concretas
+  testadas contra PostgreSQL real; não há fakes de repositório.
+- **Assinaturas (Princípio IV, máx. 3 parâmetros)**: funções com mais entradas recebem um
+  objeto de parâmetros, por exemplo `generate_occurrences(schedule: ScheduleSnapshot,
+  period: DateRange, now)` e `notify(session, request: NotificationRequest)`.
 
 ## R12. Ambiente e deploy
 
 - **Decision**: Docker Compose com serviços `nginx`, `frontend` (build → estático servido
-  pelo nginx), `backend`, `worker`, `postgres` (16), `minio`, `mailpit` (apenas dev).
+  pelo nginx), `backend` (API), `outbox-relay`, `celery-worker`, `celery-beat` (réplica
+  única), `rabbitmq` (3.13, com plugin de management), `postgres` (16), `minio`, `mailpit`
+  (apenas dev). `backend`, `outbox-relay`, `celery-worker` e `celery-beat` usam a mesma
+  imagem com comandos diferentes.
   Configuração por variáveis de ambiente; segredos fora do repositório (`.env` no
   `.gitignore`, `.env.example` versionado).
 - **Rationale**: mesmo ambiente para dev, CI e um servidor único de produção na v1.
+
+## R13. Recuperação de senha (FR-003a)
+
+- **Decision**: tabela `password_reset_token` (hash SHA-256 do token de 32 bytes, expira em
+  1h, `used_at`). `POST /auth/password-reset/request` sempre responde `204`, cadastrado ou
+  não, e só envia e-mail (pelo outbox) se a conta existir. `POST /auth/password-reset/confirm`
+  troca a senha, marca o token como usado, invalida os demais tokens da conta e **apaga todas
+  as sessões** do usuário. nginx limita a taxa da rota de solicitação.
+- **Rationale**: resposta uniforme impede descobrir quais e-mails têm conta; token de uso
+  único e curto reduz a janela de abuso; reaproveita outbox e padrão de token do link de
+  visitante (R10).
+- **Alternatives considered**: código numérico por e-mail (mais sujeito a força bruta);
+  magic link de login (muda o modelo de autenticação definido na spec).
+
+## R14. Privacidade: anonimização e exclusão de conta (FR-018 a FR-020)
+
+- **Decision**:
+  - **Visibilidade (FR-018)**: schemas de resposta separados; contato do cliente só em
+    schemas usados por rotas autorizadas às partes do agendamento. Teste de integração
+    varre as rotas públicas garantindo ausência de e-mail/telefone.
+  - **Anonimização (FR-019)**: task periódica `anonymize_old_bookings` no Celery Beat (uma vez por hora, R6)
+    substitui `client_name` por "Cliente anonimizado", zera e-mail/telefone/notas e o
+    `guest_token_hash` de agendamentos com `ends_at <= now() − 12 meses`, marcando
+    `anonymized_at`. Notificações desses agendamentos têm `recipient_email` anonimizado.
+  - **Exclusão de estúdio (FR-020a)**: `DELETE /studios/{id}` (dono, confirmação de senha):
+    cancela agendamentos futuros ativos do estúdio (`cancelled_by = studio`), encerra
+    vínculos e convites, remove os membros, marca `studio.deleted_at`; nome é mantido no
+    histórico das outras partes.
+  - **Exclusão de conta (FR-020)**: `DELETE /me` com confirmação de senha, numa transação,
+    compondo os casos de uso existentes: exclui o estúdio de que é dono (acima), remove a
+    conta das equipes, exclui o perfil de tatuador (cancela os agendamentos dele com
+    `cancelled_by = artist`, encerra vínculos, remove portfólio e fotos do MinIO após o
+    commit), cancela os agendamentos em que é cliente (`cancelled_by = client`), apaga
+    sessões e tokens e **anonimiza a conta** (soft delete: `deleted_at`, e-mail trocado por
+    valor único inválido, hash de senha removido). Tatuador mantém o `display_name` no
+    histórico das outras partes; nome e contato de cliente são apagados também nos
+    agendamentos passados.
+- **Rationale**: soft delete preserva a integridade referencial do histórico de
+  agendamentos dos outros usuários; anonimizar em vez de apagar cumpre a LGPD mantendo dados
+  não pessoais.
+- **Alternatives considered**: `DELETE` em cascata (apagaria o histórico das outras partes);
+  exclusão só via suporte (rejeitada na clarificação).
+
+## R15. Cancelamento (FR-011)
+
+- **Decision**: a transição `cancel` exige `now < starts_at` (relógio injetado); caso
+  contrário `409 booking_started`. Vale para cliente, tatuador, estúdio e link de visitante.
+
+## R16. Detalhes do pedido e imagens de referência (FR-008a)
+
+- **Decision**:
+  - `POST /bookings` passa a ser **multipart**: campos do pedido + até 3 arquivos
+    `references`. Descrição (1–1000 caracteres), local do corpo (enum fixo) e tamanho
+    (`P`/`M`/`G`) são obrigatórios.
+  - As imagens passam pelo mesmo processamento do portfólio (R7: Pillow, tipo real, ≤ 10 MB,
+    EXIF removido), mas geram **uma** variante WebP (largura máx. 1600 px). O processamento
+    acontece **antes** de abrir a transação e dos locks, para não segurar o lock do estúdio
+    durante trabalho de CPU.
+  - Ficam num bucket **privado** `booking-refs` (sem política anônima, não exposto pelo
+    nginx), na chave `booking-refs/{booking_id}/{n}.webp`. O upload ao storage ocorre dentro
+    do fluxo de criação antes do commit; se a transação falhar, o prefixo é apagado no
+    tratamento de erro.
+  - Leitura por `GET /bookings/{id}/references/{n}` (partes do agendamento) e
+    `GET /guest/bookings/{token}/references/{n}` (visitante): o backend faz streaming do
+    objeto com `Cache-Control: private, no-store`.
+  - Anonimização (FR-019) e exclusão de conta de cliente (FR-020) apagam o prefixo do
+    agendamento e as linhas de referência.
+- **Rationale**: as imagens são dados do cliente, visíveis só às partes (FR-008a/FR-018), e
+  por isso não podem usar o bucket público. Streaming pelo backend dispensa expor o MinIO ou
+  gerar URLs assinadas com host interno; o volume é baixo (≤ 3 imagens por pedido, vistas
+  poucas vezes).
+- **Alternatives considered**: URL pré-assinada de GET (exigiria expor o MinIO por outro
+  caminho do nginx com repasse de assinatura); salvar imagens no Postgres (incha backups e
+  consultas).
+- **Moderação**: fora do escopo da v1 (spec, Assumptions). O risco fica contido porque as
+  imagens nunca são públicas.
+
+## R17. Verificação de e-mail como condição de visibilidade (FR-001a)
+
+- **Decision**: o cadastro emite token de verificação (R13: mesmo formato, validade 48h)
+  para toda conta; `POST /auth/verify-email/resend` reenvia (limitado no nginx). Um
+  filtro único de repositório, "publicável", é aplicado: tatuador publicável = conta com
+  `email_verified_at IS NOT NULL AND deleted_at IS NULL`; estúdio publicável = estúdio sem
+  `deleted_at` cujo **dono** é publicável. Ele vale em páginas públicas, buscas, lista de tatuadores do
+  estúdio e disponibilidade. A criação de agendamento exige estúdio e tatuador publicáveis
+  (`409 slot_unavailable` caso contrário, sem revelar o motivo ao visitante). Estúdio e
+  tatuador não verificados usam o painel normalmente, com banner de aviso.
+- **Rationale**: garante que notificações de pedidos cheguem ao destinatário (FR-012); um
+  filtro centralizado evita esquecer a regra em alguma consulta.
+
+## R18. Convites de vínculo (FR-004a)
+
+- **Decision**: `affiliation.expires_at = invited_at + 24h`; a task periódica do Celery Beat expira (R6) e notifica
+  o estúdio (`affiliation_expired`). O estúdio cancela com `POST /affiliations/{id}/cancel`
+  (`invited` → `cancelled`, sem notificação ao tatuador; o convite some da lista dele).
+  Aceitar/recusar convite vencido ou cancelado → `409 invitation_not_valid`; aceitar checa
+  `expires_at` também na hora, sem depender da task periódica. O índice único parcial (só `invited`
+  e `active`) permite convidar de novo depois.
+
+## R19. Modelo de contas: pessoa com perfis e papéis por estúdio (FR-001, FR-003)
+
+- **Decision**: `user` representa a pessoa (nome, e-mail, telefone, senha) e **não tem
+  papel**. Capacidades são relações:
+  - `artist_profile` 0..1 por `user` (perfil de tatuador);
+  - `studio` é entidade própria com `owner_user_id` **único** (no máximo 1 estúdio por dono,
+    garantido por índice único parcial `WHERE deleted_at IS NULL`);
+  - `studio_member(studio_id, user_id)` N:N, com restrição de que o dono não é membro do
+    próprio estúdio;
+  - agendar como cliente não exige relação: qualquer `user` (ou visitante).
+  O frontend recebe em `GET /auth/me` as "áreas" da conta (tatuador? estúdio próprio? estúdios
+  em que é membro) e mostra um seletor de área no painel; as rotas do estúdio são
+  parametrizadas por `studio_id` (`/studios/{id}/...`), não por `/me`.
+- **Rationale**: atende "o dono pode ser tatuador" e "tatuador pode ser membro de vários
+  estúdios" sem contas duplicadas. Autorização por recurso (R3) é a forma natural quando uma
+  mesma pessoa tem permissões diferentes em estúdios diferentes.
+- **Alternatives considered**: papel único na conta (modelo anterior, rejeitado na
+  clarificação); RBAC genérico com tabela de permissões (YAGNI: só existem dois papéis, dono e
+  membro).
+- **Notificações do estúdio (FR-024)**: notificação in-app ganha `studio_id` opcional; as do
+  estúdio são listadas para dono e membros pela relação, sem duplicar linhas. E-mails do
+  estúdio vão só para o dono.
+
+## R20. Equipe e registro de ações (FR-021 a FR-023)
+
+- **Decision**:
+  - **Convite de membro**: `studio_member_invite` (e-mail convidado, token hash, expira em 7
+    dias). Aceitar exige estar logado com uma conta **cujo e-mail é o convidado**; sem conta,
+    o link leva ao cadastro com o e-mail pré-preenchido e aceita em seguida. Remover membro
+    apaga a linha de `studio_member`; como a autorização é checada a cada requisição, o
+    acesso cai na hora, sem mexer nas sessões da pessoa.
+  - **Registro de ações**: tabela `studio_audit_log` (append-only) com `studio_id`,
+    `actor_user_id`, `actor_name` (snapshot), `action` (enum), `target` (tipo e id),
+    `changes` (jsonb com antes/depois resumido) e `created_at`. É gravado **na mesma
+    transação** da ação, por um decorator/serviço `AuditTrail.record(session, entry)`
+    chamado pelos casos de uso de gestão — nunca pelo router. A task periódica `purge_audit_log` (R6) apaga entradas com
+    mais de 12 meses.
+  - Ações registradas: regras, exceções, avulsos, macas, janela de antecedência, dias de
+    atendimento, convites/vínculos, membros, cancelamentos de agendamento pelo estúdio.
+- **Rationale**: gravar na mesma transação garante que não exista mudança sem registro;
+  centralizar num serviço evita que cada caso de uso monte a entrada de um jeito.
+- **Alternatives considered**: triggers no banco (perdem o autor da requisição sem gambiarra
+  de variável de sessão); log em arquivo (não consultável pelo dono).
+
+## R21. Dias de atendimento e janela de antecedência (FR-007d, FR-007e)
+
+- **Decision**: `affiliation.weekdays` (smallint bitmask, 7 bits, padrão 127 = todos) e
+  `studio.min_notice_hours` (0–72, padrão 24) e `studio.max_advance_days` (7–180, padrão
+  60). A disponibilidade filtra ocorrências pelo dia da semana **local do estúdio** do
+  início do horário e pela janela `[now + min_notice, now + max_advance]`; criação e
+  remarcação revalidam os dois dentro da transação (código `slot_unavailable`). Alterações
+  não tocam agendamentos existentes.
+- **Rationale**: bitmask é compacto, fácil de indexar/validar e de exibir como 7 checkboxes.
+
+## R22. Lembretes (FR-012a)
+
+- **Decision**: duas tasks periódicas no Celery Beat (R6), que enfileiram os e-mails pelo
+  outbox:
+  - `send_client_reminders`: agendamentos `confirmed` com `starts_at` entre `now + 23h` e
+    `now + 24h`, `reminder_sent_at IS NULL` e `decided_at <= starts_at − 24h`; cria a notificação, a
+    mensagem de outbox e marca `reminder_sent_at` na mesma transação. Remarcação zera
+    `reminder_sent_at`.
+  - `send_artist_daily_digest`: agendada no Beat com `crontab(hour=18, minute=0)` no fuso
+    `America/Sao_Paulo`; agrupa por tatuador os
+    agendamentos `confirmed` do dia seguinte (dia de Brasília) e grava uma notificação por
+    tatuador com agendamentos. Uma tabela `job_run(job, run_date)` com chave única garante
+    execução única por dia mesmo com restart.
+- **Rationale**: marcas de envio na própria linha/tabela tornam as tasks idempotentes mesmo
+  com reentrega do RabbitMQ ou restart do Beat; a janela de 1h dos lembretes tolera atrasos
+  de execução.
